@@ -1,0 +1,227 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ACCTMIG1.
+       AUTHOR. MAINFRAME-MODERNIZATION-TEAM.
+      *================================================================*
+      * PROGRAM  : ACCTMIG1                                            *
+      * PURPOSE  : LEGACY ACCOUNT MIGRATION & TRANSFORMATION ENGINE    *
+      *            READS LEGACY ACCOUNTS, VALIDATES ELIGIBILITY,       *
+      *            TRANSFORMS TO TARGET SCHEMA, AND WRITES AUDIT LOG.  *
+      *================================================================*
+
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT LEGACY-ACCT-FILE ASSIGN TO LGCYACCT
+                  ORGANIZATION IS SEQUENTIAL
+                  FILE STATUS IS WS-LGCY-STATUS.
+
+           SELECT TARGET-ACCT-FILE ASSIGN TO MIGRACCT
+                  ORGANIZATION IS SEQUENTIAL
+                  FILE STATUS IS WS-TGT-STATUS.
+
+           SELECT REJECT-ACCT-FILE ASSIGN TO REJACCT
+                  ORGANIZATION IS SEQUENTIAL
+                  FILE STATUS IS WS-REJ-STATUS.
+
+           SELECT MIGRATION-RPT-FILE ASSIGN TO MIGRPT
+                  ORGANIZATION IS SEQUENTIAL
+                  FILE STATUS IS WS-RPT-STATUS.
+
+       DATA DIVISION.
+       FILE SECTION.
+       FD  LEGACY-ACCT-FILE
+           RECORDING MODE IS F.
+       01  FD-LEGACY-REC                 PIC X(80).
+
+       FD  TARGET-ACCT-FILE
+           RECORDING MODE IS F.
+       01  FD-TARGET-REC                 PIC X(150).
+
+       FD  REJECT-ACCT-FILE
+           RECORDING MODE IS F.
+       01  FD-REJECT-REC                 PIC X(150).
+
+       FD  MIGRATION-RPT-FILE
+           RECORDING MODE IS F.
+       01  FD-REPORT-LINE                PIC X(132).
+
+       WORKING-STORAGE SECTION.
+       01  WS-FILE-STATUS-FLAGS.
+           05  WS-LGCY-STATUS            PIC X(02) VALUE SPACES.
+           05  WS-TGT-STATUS             PIC X(02) VALUE SPACES.
+           05  WS-REJ-STATUS             PIC X(02) VALUE SPACES.
+           05  WS-RPT-STATUS             PIC X(02) VALUE SPACES.
+           05  WS-EOF-SW                 PIC X(01) VALUE 'N'.
+               88  END-OF-FILE               VALUE 'Y'.
+
+       01  WS-MIGRATION-COUNTERS.
+           05  WS-READ-CNT               PIC 9(07) VALUE ZERO.
+           05  WS-MIGRATED-CNT           PIC 9(07) VALUE ZERO.
+           05  WS-REJECTED-CNT           PIC 9(07) VALUE ZERO.
+           05  WS-TOTAL-MIGR-BAL         PIC S9(15)V99 COMP-3 VALUE 0.
+           05  WS-FX-RATE                PIC 9(03)V9(04) VALUE 1.0000.
+           05  WS-CONVERTED-BAL          PIC S9(13)V99 COMP-3 VALUE 0.
+
+           COPY ACCTMIGC.
+
+       PROCEDURE DIVISION.
+       0000-MAIN-CONTROL.
+           PERFORM 1000-INITIALIZE-MIGRATION
+           PERFORM 2000-PROCESS-ACCOUNTS
+               UNTIL END-OF-FILE
+           PERFORM 3000-WRITE-RECON-SUMMARY
+           PERFORM 9000-TERMINATE-PROGRAM
+           STOP RUN.
+
+       1000-INITIALIZE-MIGRATION.
+           OPEN INPUT  LEGACY-ACCT-FILE
+                OUTPUT TARGET-ACCT-FILE
+                       REJECT-ACCT-FILE
+                       MIGRATION-RPT-FILE
+           PERFORM 1100-READ-LEGACY-ACCOUNT.
+
+       1100-READ-LEGACY-ACCOUNT.
+           READ LEGACY-ACCT-FILE INTO LEGACY-ACCT-REC
+               AT END
+                   SET END-OF-FILE TO TRUE
+               NOT AT END
+                   ADD 1 TO WS-READ-CNT
+           END-READ.
+
+       2000-PROCESS-ACCOUNTS.
+           INITIALIZE TARGET-MIGR-REC
+           PERFORM 2100-VALIDATE-LEGACY-RECORD
+           IF TGT-MIGRATION-STATUS = 'REJECTED'
+               PERFORM 2800-WRITE-REJECT-RECORD
+           ELSE
+               PERFORM 2200-TRANSFORM-IDENTIFIERS
+               PERFORM 2300-MAP-PRODUCT-AND-STATUS
+               PERFORM 2400-CALCULATE-SETTLEMENT-BAL
+               PERFORM 2500-ASSIGN-RISK-TIER
+               PERFORM 2700-WRITE-TARGET-RECORD
+           END-IF
+           PERFORM 1100-READ-LEGACY-ACCOUNT.
+
+       2100-VALIDATE-LEGACY-RECORD.
+           MOVE 'READY   ' TO TGT-MIGRATION-STATUS
+           MOVE SPACES     TO TGT-REJECT-REASON
+
+           IF LGCY-ACCT-ID = SPACES OR LOW-VALUES
+               MOVE 'REJECTED' TO TGT-MIGRATION-STATUS
+               MOVE 'MISSING LEGACY ACCOUNT ID' TO TGT-REJECT-REASON
+           ELSE IF LGCY-CUST-ID = SPACES OR LOW-VALUES
+               MOVE 'REJECTED' TO TGT-MIGRATION-STATUS
+               MOVE 'MISSING CUSTOMER ID' TO TGT-REJECT-REASON
+           ELSE IF LGCY-STATUS-CLOSED AND LGCY-CURR-BAL = ZERO
+               MOVE 'REJECTED' TO TGT-MIGRATION-STATUS
+               MOVE 'CLOSED ZERO-BAL ACCOUNT SKIP' TO TGT-REJECT-REASON
+           END-IF.
+
+       2200-TRANSFORM-IDENTIFIERS.
+           STRING 'GLB-' DELIMITED BY SIZE
+                  LGCY-BRANCH-CD DELIMITED BY SIZE
+                  '-' DELIMITED BY SIZE
+                  LGCY-ACCT-ID DELIMITED BY SIZE
+             INTO TGT-GLOBAL-ACCT-KEY
+           END-STRING
+
+           STRING 'PTY-' DELIMITED BY SIZE
+                  LGCY-CUST-ID DELIMITED BY SIZE
+             INTO TGT-PARTY-ID
+           END-STRING
+
+           STRING LGCY-OPEN-DATE(1:4) '-'
+                  LGCY-OPEN-DATE(5:2) '-'
+                  LGCY-OPEN-DATE(7:2)
+                  DELIMITED BY SIZE
+             INTO TGT-OPEN-ISO-DATE
+           END-STRING.
+
+       2300-MAP-PRODUCT-AND-STATUS.
+           EVALUATE TRUE
+               WHEN LGCY-TYPE-SAVINGS
+                   MOVE 'SAV001' TO TGT-PRODUCT-CODE
+               WHEN LGCY-TYPE-CURRENT
+                   MOVE 'CHK001' TO TGT-PRODUCT-CODE
+               WHEN LGCY-TYPE-LOAN
+                   MOVE 'LON001' TO TGT-PRODUCT-CODE
+               WHEN OTHER
+                   MOVE 'GEN999' TO TGT-PRODUCT-CODE
+           END-EVALUATE
+
+           EVALUATE TRUE
+               WHEN LGCY-STATUS-ACTIVE
+                   MOVE 'ACTIVE    ' TO TGT-LIFECYCLE-STATUS
+               WHEN LGCY-STATUS-DORMANT
+                   MOVE 'DORMANT   ' TO TGT-LIFECYCLE-STATUS
+               WHEN LGCY-STATUS-CLOSED
+                   MOVE 'CLOSING   ' TO TGT-LIFECYCLE-STATUS
+               WHEN OTHER
+                   MOVE 'REVIEW    ' TO TGT-LIFECYCLE-STATUS
+           END-EVALUATE.
+
+       2400-CALCULATE-SETTLEMENT-BAL.
+           EVALUATE LGCY-CURRENCY-CD
+               WHEN 'USD'
+                   MOVE 1.0000 TO WS-FX-RATE
+                   MOVE 'USD'  TO TGT-ISO-CURRENCY
+               WHEN 'CAD'
+                   MOVE 0.7400 TO WS-FX-RATE
+                   MOVE 'USD'  TO TGT-ISO-CURRENCY
+               WHEN 'EUR'
+                   MOVE 1.0800 TO WS-FX-RATE
+                   MOVE 'USD'  TO TGT-ISO-CURRENCY
+               WHEN OTHER
+                   MOVE 1.0000 TO WS-FX-RATE
+                   MOVE 'USD'  TO TGT-ISO-CURRENCY
+           END-EVALUATE
+
+           COMPUTE WS-CONVERTED-BAL ROUNDED =
+               LGCY-CURR-BAL * WS-FX-RATE
+           MOVE WS-CONVERTED-BAL TO TGT-PRINCIPAL-BAL
+
+           COMPUTE TGT-ACCRUED-INT-AMT ROUNDED =
+               LGCY-ACCRUED-INT * WS-FX-RATE
+
+           COMPUTE TGT-TOTAL-SETTLEMENT-BAL ROUNDED =
+               TGT-PRINCIPAL-BAL + TGT-ACCRUED-INT-AMT.
+
+       2500-ASSIGN-RISK-TIER.
+           IF LGCY-TYPE-LOAN AND TGT-TOTAL-SETTLEMENT-BAL < -100000
+               MOVE 'HIGH    ' TO TGT-RISK-TIER
+           ELSE IF LGCY-STATUS-DORMANT
+               MOVE 'MEDIUM  ' TO TGT-RISK-TIER
+           ELSE IF TGT-TOTAL-SETTLEMENT-BAL >= 250000
+               MOVE 'VIP-PLAT' TO TGT-RISK-TIER
+           ELSE
+               MOVE 'STANDARD' TO TGT-RISK-TIER
+           END-IF
+           MOVE 'MIGRATED' TO TGT-MIGRATION-STATUS.
+
+       2700-WRITE-TARGET-RECORD.
+           WRITE FD-TARGET-REC FROM TARGET-MIGR-REC
+           ADD 1 TO WS-MIGRATED-CNT
+           ADD TGT-TOTAL-SETTLEMENT-BAL TO WS-TOTAL-MIGR-BAL.
+
+       2800-WRITE-REJECT-RECORD.
+           MOVE LGCY-ACCT-ID TO TGT-GLOBAL-ACCT-KEY
+           MOVE LGCY-CUST-ID TO TGT-PARTY-ID
+           WRITE FD-REJECT-REC FROM TARGET-MIGR-REC
+           ADD 1 TO WS-REJECTED-CNT.
+
+       3000-WRITE-RECON-SUMMARY.
+           MOVE SPACES TO FD-REPORT-LINE
+           STRING 'ACCOUNT MIGRATION RECONCILIATION: READ='
+                  WS-READ-CNT
+                  ' MIGRATED=' WS-MIGRATED-CNT
+                  ' REJECTED=' WS-REJECTED-CNT
+                  DELIMITED BY SIZE
+             INTO FD-REPORT-LINE
+           END-STRING
+           WRITE FD-REPORT-LINE.
+
+       9000-TERMINATE-PROGRAM.
+           CLOSE LEGACY-ACCT-FILE
+                 TARGET-ACCT-FILE
+                 REJECT-ACCT-FILE
+                 MIGRATION-RPT-FILE.
